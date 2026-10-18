@@ -18,8 +18,16 @@ const path = require('path')
 const axios = require('axios')
 const { handleMessages, handleGroupParticipantUpdate, handleStatus } = require('./main');
 const PhoneNumber = require('awesome-phonenumber')
-const { imageToWebp, videoToWebp, writeExifImg, writeExifVid } = require('./lib/exif')
-const { smsg, isUrl, generateMessageTag, getBuffer, getSizeMedia, fetch, await, sleep, reSize } = require('./lib/myfunc')
+
+// ✅ QR Code حقيقي
+let qrcode
+try {
+    qrcode = require('qrcode-terminal')
+} catch (e) {
+    qrcode = null
+    console.log('⚠️ qrcode-terminal غير مثبت')
+}
+
 const {
     default: makeWASocket,
     useMultiFileAuthState,
@@ -44,52 +52,150 @@ const { PHONENUMBER_MCC } = require('@whiskeysockets/baileys/lib/Utils/generics'
 const { rmSync, existsSync } = require('fs')
 const { join } = require('path')
 
-// استيراد متجر خفيف الوزن
-const store = require('./lib/lightweight_store')
+// ============= ✅ استيرادات آمنة =============
+function safeRequire(modulePath, fallback = null) {
+    try {
+        return require(modulePath);
+    } catch (e) {
+        console.log(`⚠️ تعذر استيراد ${modulePath}: ${e.message.split('\n')[0]}`);
+        return fallback;
+    }
+}
 
-// استيراد أمر APK
-const apkCommand = require('./commands/apk');
+// ✅ متجر خفيف الوزن
+let store
+try {
+    store = require('./lib/lightweight_store')
+    store.readFromFile()
+} catch (e) {
+    console.log('⚠️ lib/lightweight_store.js مفقود')
+    store = {
+        readFromFile: () => {},
+        writeToFile: () => {},
+        bind: () => {},
+        loadMessage: async () => null,
+        contacts: {}
+    }
+}
 
-// ===== استيراد أمر الملف الشخصي =====
-const profileCommand = require('./commands/profile');
+// ✅ أمر APK
+let apkCommand
+try {
+    apkCommand = require('./commands/apk')
+} catch (e) {
+    console.log('⚠️ commands/apk.js مفقود')
+    apkCommand = null
+}
 
-// استيراد بوت الأنمي
-const AnimeBot = require('./commands/animeBot');
-const animeBot = new AnimeBot();
+// ✅ أمر الملف الشخصي
+let profileCommand
+try {
+    profileCommand = require('./commands/profile')
+} catch (e) {
+    console.log('⚠️ commands/profile.js مفقود')
+    profileCommand = null
+}
 
-// استيراد مكافحة الروابط
-const { Antilink } = require('./lib/antilink');
+// ✅ بوت الأنمي
+let animeBot = null
+try {
+    const AnimeBot = require('./commands/animeBot')
+    animeBot = new AnimeBot()
+} catch (e) {
+    console.log('⚠️ commands/animeBot.js مفقود — سيتم تعطيل أوامر الأنمي')
+}
 
-// ===== استيراد أمر فيسبوك =====
-const { facebookCommand, handleSelection, COMMANDS } = require('./commands/facebook');
+// ✅ مكافحة الروابط
+let Antilink
+try {
+    ({ Antilink } = require('./lib/antilink'))
+} catch (e) {
+    console.log('⚠️ lib/antilink.js مفقود')
+    Antilink = async () => {}
+}
 
-// تهيئة المتجر
-store.readFromFile()
+// ✅ أمر فيسبوك
+let facebookCommand, handleSelection, COMMANDS
+try {
+    ({ facebookCommand, handleSelection, COMMANDS } = require('./commands/facebook'))
+} catch (e) {
+    console.log('⚠️ commands/facebook.js مفقود')
+    facebookCommand = null
+    handleSelection = null
+    COMMANDS = {}
+}
+
+// ✅ أمر مكافحة الروابط
+let handleAntilinkCommand
+try {
+    ({ handleAntilinkCommand } = require('./commands/antilink'))
+} catch (e) {
+    console.log('⚠️ commands/antilink.js مفقود')
+    handleAntilinkCommand = async () => {}
+}
+
 const settings = require('./settings')
 setInterval(() => store.writeToFile(), settings.storeWriteInterval || 10000)
 
-// تحسين الذاكرة - تنظيف الذاكرة التلقائي
+// ✅ isAdmin (ترجع كائن)
+async function isAdmin(sock, jid, participant) {
+    try {
+        const groupMetadata = await sock.groupMetadata(jid);
+        const participantData = groupMetadata.participants.find(p => p.id === participant);
+        const botId = sock.user.id.split(':')[0] + '@s.whatsapp.net';
+        const botData = groupMetadata.participants.find(p => p.id === botId);
+        return {
+            isSenderAdmin: participantData?.admin === 'admin' || participantData?.admin === 'superadmin',
+            isBotAdmin: botData?.admin === 'admin' || botData?.admin === 'superadmin'
+        };
+    } catch (error) {
+        console.error('خطأ في isAdmin:', error.message);
+        return { isSenderAdmin: false, isBotAdmin: false };
+    }
+}
+
+// ✅ isSudo محلية
+async function isSudo(jid) {
+    try {
+        if (!jid) return false;
+        const sudoFile = './data/sudo.json';
+        if (!fs.existsSync(sudoFile)) return false;
+        const sudoList = JSON.parse(fs.readFileSync(sudoFile, 'utf-8'));
+        if (!Array.isArray(sudoList)) return false;
+        const number = jid.split('@')[0].split(':')[0];
+        return sudoList.includes(number) || sudoList.includes(jid);
+    } catch (e) {
+        return false;
+    }
+}
+
+// تحسين الذاكرة
 setInterval(() => {
     if (global.gc) {
         global.gc()
         console.log('🧹 تم تنظيف الذاكرة')
     }
-}, 60_000) // كل دقيقة
+}, 60_000)
 
-// مراقبة الذاكرة - إعادة التشغيل إذا أصبحت مرتفعة جداً
+// مراقبة الذاكرة
 setInterval(() => {
     const المستخدم = process.memoryUsage().rss / 1024 / 1024
     if (المستخدم > 400) {
         console.log('⚠️ الرام مرتفع جداً (>400MB)، جاري إعادة تشغيل البوت...')
         process.exit(1)
     }
-}, 30_000) // كل 30 ثانية
-
-// ============= تم التعديل - تعطيل رمز الاقتران =============
-let phoneNumber = ""  // فارغة لاستخدام QR Code
-let owner = JSON.parse(fs.readFileSync('./data/owner.json'))
+}, 30_000)
 
 // ============= معلومات البوت =============
+let phoneNumber = ""
+let owner = []
+try {
+    owner = JSON.parse(fs.readFileSync('./data/owner.json'))
+} catch (e) {
+    console.log('⚠️ data/owner.json مفقود')
+    owner = []
+}
+
 global.botname = "JAWAD.BOT"
 global.motif_emoji = "•"
 global.قناة_اليوتيوب = "jawad_bot"
@@ -98,9 +204,15 @@ global.رابط_القناة = "https://whatsapp.com/channel/0029Vb7kJt29Gv7W5J0
 global.معرف_القناة = "120363427092431731@newsletter"
 global.مجموعة_الدعم = "https://chat.whatsapp.com/LqoheqNRThHLBDbMCwvV7J?mode=gi_t"
 
-// ============= تم التعديل - تعطيل رمز الاقتران =============
-const pairingCode = false  // QR Code
+const pairingCode = false
 const useMobile = process.argv.includes("--mobile")
+
+// ✅ منع تشغيل نسختين في نفس العملية
+if (global.__JAWAD_BOT_STARTED__) {
+    console.log('⚠️ البوت يعمل بالفعل — تم تجاهل التشغيل المكرر')
+    return
+}
+global.__JAWAD_BOT_STARTED__ = true
 
 // دالة بدء البوت
 async function startJawadBot() {
@@ -112,7 +224,7 @@ async function startJawadBot() {
         const JawadBot = makeWASocket({
             version,
             logger: pino({ level: 'silent' }),
-            printQRInTerminal: true,  // QR Code
+            printQRInTerminal: false,  // ✅ سنستخدم qrcode-terminal
             browser: ["JAWAD.BOT", "Chrome", "120.0.0"],
             auth: {
                 creds: state.creds,
@@ -130,10 +242,8 @@ async function startJawadBot() {
             defaultQueryTimeoutMs: 60000,
             connectTimeoutMs: 60000,
             keepAliveIntervalMs: 10000,
-            // إضافة تأخير بين الطلبات لتجنب rate limit
             requestTimeoutMs: 30000,
             patchMessageBeforeSending: (message) => {
-                // تقليل حجم البيانات المرسلة
                 const requiresPatch = !!(
                     message.buttonsMessage ||
                     message.templateMessage ||
@@ -156,61 +266,47 @@ async function startJawadBot() {
             }
         })
 
-        // حفظ بيانات الدخول عند تحديثها
         JawadBot.ev.on('creds.update', saveCreds)
-
         store.bind(JawadBot.ev)
 
-        // ============= دوال معالجة أوامر الأنمي المعدلة =============
+        // ============= دوال معالجة أوامر الأنمي =============
         async function handleEditCommand(sock, message) {
             try {
                 const from = message.key.remoteJid;
                 const sender = message.key.participant || message.key.remoteJid;
                 
-                // 🔍 تفاعل عند بدء البحث
-                await sock.sendMessage(from, {
-                    react: { text: '🔍', key: message.key }
-                });
+                if (!animeBot) {
+                    await sock.sendMessage(from, { text: '❌ أوامر الأنمي معطلة (ملف animeBot.js مفقود)' });
+                    return;
+                }
                 
-                // تأخير بسيط لتجنب rate limit
+                await sock.sendMessage(from, { react: { text: '🔍', key: message.key } });
                 await delay(1000);
                 
                 const videoName = animeBot.getRandomVideo();
                 
                 if (!videoName) {
-                    await sock.sendMessage(from, {
-                        text: '❌ عذراً، لا يوجد فيديوهات متاحة حالياً في مجلد anime'
-                    });
+                    await sock.sendMessage(from, { text: '❌ عذراً، لا يوجد فيديوهات متاحة حالياً' });
                     return;
                 }
 
                 const videoPath = animeBot.getVideoPath(videoName);
                 
                 if (!animeBot.videoExists(videoName)) {
-                    await sock.sendMessage(from, {
-                        text: `❌ الفيديو ${videoName} غير موجود في المجلد`
-                    });
+                    await sock.sendMessage(from, { text: `❌ الفيديو ${videoName} غير موجود` });
                     return;
                 }
 
                 const videoBuffer = fs.readFileSync(videoPath);
                 
                 if (videoBuffer.length === 0) {
-                    await sock.sendMessage(from, {
-                        text: `⚠️ الفيديو ${videoName} فارغ. يرجى تحميل فيديو حقيقي`
-                    });
+                    await sock.sendMessage(from, { text: `⚠️ الفيديو فارغ` });
                     return;
                 }
 
-                // 🕯️ تفاعل عند النجاح في العثور على فيديو
-                await sock.sendMessage(from, {
-                    react: { text: '🕯️', key: message.key }
-                });
-
-                // تأخير بسيط
+                await sock.sendMessage(from, { react: { text: '🕯️', key: message.key } });
                 await delay(1000);
 
-                // تنسيق الرسالة الجديد بدون إحصائيات
                 const caption = `𝑬𝑫𝑰𝑻 𝑨𝑵𝑰𝑴𝑬🍁\n*🪺تم تحميل بواسطة:* ~@${sender.split('@')[0]}~\n\n\`👨🏼‍💻𝑫𝒂𝒓𝒌𝒙𝒆𝒄𝒖𝒕𝒐𝒓\``;
 
                 await sock.sendMessage(from, {
@@ -221,72 +317,37 @@ async function startJawadBot() {
                         forwardingScore: 0,
                         isForwarded: false
                     }
-                }, {
-                    mediaUploadTimeoutMs: 60000
-                });
+                }, { mediaUploadTimeoutMs: 60000 });
 
-                // 💎 تفاعل بعد إرسال الفيديو بنجاح
-                await sock.sendMessage(from, {
-                    react: { text: '💎', key: message.key }
-                });
-
+                await sock.sendMessage(from, { react: { text: '💎', key: message.key } });
                 console.log(`✅ تم إرسال: ${videoName}`);
 
             } catch (error) {
                 console.error('❌ خطأ في أمر .edit:', error);
                 const from = message.key.remoteJid;
-                
-                // تأخير قبل إرسال رسالة الخطأ
                 await delay(2000);
-                
-                await sock.sendMessage(from, {
-                    text: '❌ حدث خطأ أثناء تحميل الفيديو. حاول مرة أخرى.'
-                });
+                await sock.sendMessage(from, { text: '❌ حدث خطأ أثناء تحميل الفيديو.' });
             }
         }
 
         async function handleResetCommand(sock, message) {
             try {
                 const from = message.key.remoteJid;
-                animeBot.resetUsedVideos();
-                
+                if (animeBot) animeBot.resetUsedVideos();
                 await delay(1000);
-                
                 await sock.sendMessage(from, {
-                    text: `🔄 *تم إعادة تعيين قائمة الفيديوهات*\n\n` +
-                          `📹 جميع الفيديوهات متاحة الآن\n\n` +
-                          `_استخدم .edit للحصول على فيديو عشوائي_`
+                    text: `🔄 *تم إعادة تعيين قائمة الفيديوهات*\n\n📹 جميع الفيديوهات متاحة الآن`
                 });
             } catch (error) {
                 console.error('❌ خطأ في أمر .reset:', error);
             }
         }
 
-        async function handleHelpCommand(sock, message) {
-            try {
-                const from = message.key.remoteJid;
-                
-                await delay(1000);
-                
-                await sock.sendMessage(from, {
-                    text: `🎬 *𝑬𝑫𝑰𝑻 𝑨𝑵𝑰𝑴𝑬🍁*\n\n` +
-                          `📋 *الأوامر المتاحة:*\n\n` +
-                          `🎥 *.edit* - تحميل فيديو عشوائي\n` +
-                          `🔄 *.reset* - إعادة تعيين القائمة\n` +
-                          `❓ *.help* - عرض هذه المساعدة\n\n` +
-                          `👨🏼‍💻 *𝑫𝒂𝒓𝒌𝒙𝒆𝒄𝒖𝒕𝒐𝒓*`
-                });
-            } catch (error) {
-                console.error('❌ خطأ في أمر .help:', error);
-            }
-        }
-
         // ===== دالة معالجة أوامر فيسبوك =====
         async function handleFacebookCommand(message, from) {
             try {
+                if (!facebookCommand) return false;
                 const text = message.message?.conversation || message.message?.extendedTextMessage?.text || '';
-                
-                // التحقق من الأوامر
                 if (text.startsWith('.فيس') || text.startsWith('.fb')) {
                     await facebookCommand(JawadBot, from, message);
                     return true;
@@ -298,21 +359,21 @@ async function startJawadBot() {
             }
         }
 
-        // ============= دالة معالجة الأوامر =============
+        // ============= دالة معالجة الأوامر الخاصة =============
+        // ✅ هذه الدالة تعالج فقط: edit, reset, facebook
+        // ✅ باقي الأوامر يمررها main.js
         async function handleCommands(message, from) {
             try {
-                // التحقق من أن الرسالة تحتوي على نص
                 if (!message.message?.conversation && !message.message?.extendedTextMessage?.text) {
                     return false;
                 }
 
-                // استخراج النص
                 let text = message.message?.conversation || 
                            message.message?.extendedTextMessage?.text || 
                            '';
                 
                 // ===== معالجة اختيار نتائج فيسبوك =====
-                if (global.searchResults && global.searchResults[from]) {
+                if (handleSelection && global.searchResults && global.searchResults[from]) {
                     const handled = await handleSelection(JawadBot, from, message);
                     if (handled) return true;
                 }
@@ -321,7 +382,6 @@ async function startJawadBot() {
                 const facebookHandled = await handleFacebookCommand(message, from);
                 if (facebookHandled) return true;
 
-                // التحقق من أن النص يبدأ بالأمر
                 const prefixes = ['!', '.', '#', '/', '?'];
                 let command = '';
                 let args = [];
@@ -339,29 +399,20 @@ async function startJawadBot() {
                 
                 // ===== معالجة أوامر APK =====
                 const apkAliases = ['apk', 'apkdl', 'getapk', 'تحميل', 'تنزيل'];
-                if (apkAliases.includes(command)) {
+                if (apkAliases.includes(command) && apkCommand) {
                     if (args.length === 0) {
                         await JawadBot.sendMessage(from, {
-                            text: `❌ *الرجاء كتابة اسم التطبيق*
-
-📌 *مثال:*
-\`.apk واتساب\`
-\`.apk فيسبوك\`
-\`.apk انستغرام\`
-\`.apk whatsapp\`
-
-💡 يمكنك استخدام الاسم بالعربية أو الإنجليزية`
+                            text: `❌ *الرجاء كتابة اسم التطبيق*\n\n📌 *مثال:*\n\`.apk واتساب\``
                         });
                         return true;
                     }
-                    
                     await apkCommand.execute(message, args, JawadBot);
                     return true;
                 }
                 
                 // ===== معالجة أمر الملف الشخصي =====
                 const profileAliases = ['profile', 'ملفي', 'جواد'];
-                if (profileAliases.includes(command)) {
+                if (profileAliases.includes(command) && profileCommand) {
                     await profileCommand.execute(JawadBot, message, args);
                     return true;
                 }
@@ -369,30 +420,22 @@ async function startJawadBot() {
                 // ===== معالجة أوامر مكافحة الروابط =====
                 const antilinkAliases = ['منع الروابط', 'antilink', 'الروابط'];
                 if (antilinkAliases.includes(command)) {
-                    const { handleAntilinkCommand } = require('./commands/antilink');
                     const sender = message.key.participant || message.key.remoteJid;
-                    const isSenderAdmin = await isAdmin(JawadBot, from, sender);
-                    await handleAntilinkCommand(JawadBot, from, text, sender, isSenderAdmin, message);
+                    const adminStatus = await isAdmin(JawadBot, from, sender);
+                    await handleAntilinkCommand(JawadBot, from, text, sender, adminStatus.isSenderAdmin, message);
                     return true;
                 }
                 
-                // ===== معالجة أوامر الأنمي المعدلة =====
+                // ===== معالجة أوامر الأنمي =====
                 switch(command) {
                     case 'edit':
                         await handleEditCommand(JawadBot, message);
                         return true;
-                        
                     case 'reset':
                         await handleResetCommand(JawadBot, message);
                         return true;
-                        
-                    case 'help':
-                    case 'مساعدة':
-                        await handleHelpCommand(JawadBot, message);
-                        return true;
-                        
                     default:
-                        return false;
+                        return false;  // ✅ باقي الأوامر تذهب إلى main.js
                 }
                 
             } catch (error) {
@@ -419,64 +462,46 @@ async function startJawadBot() {
                 
                 if (الرسالة.key.id.startsWith('BAE5') && الرسالة.key.id.length === 16) return
 
-                // تنظيف ذاكرة التخزين المؤقت للرسائل
                 if (JawadBot?.msgRetryCounterCache) {
                     JawadBot.msgRetryCounterCache.clear()
                 }
 
-                // ===== معالجة مكافحة الروابط (قبل الأوامر) =====
+                // ===== معالجة مكافحة الروابط =====
                 const from = الرسالة.key?.remoteJid;
                 if (from && from.endsWith('@g.us')) {
-                    // تشغيل مكافحة الروابط
                     try {
                         await Antilink(الرسالة, JawadBot);
                     } catch (error) {
-                        console.error('خطأ في مكافحة الروابط:', error);
+                        console.error('خطأ في مكافحة الروابط:', error.message);
                     }
                 }
 
-                // ===== معالجة الأوامر =====
+                // ===== معالجة الأوامر الخاصة (edit/reset/facebook/apk/profile) =====
                 if (from) {
                     const isCommandHandled = await handleCommands(الرسالة, from);
                     if (isCommandHandled) {
-                        return; // تم تنفيذ الأمر، لا حاجة لمعالجة أخرى
+                        return;
                     }
                 }
-                // ===== نهاية معالجة الأوامر =====
 
+                // ===== تمرير كل الأوامر الأخرى إلى main.js =====
                 try {
                     await handleMessages(JawadBot, تحديث_المحادثة, true)
                 } catch (خطأ) {
-                    // تجاهل أخطاء rate limit
                     if (خطأ?.data === 429 || خطأ?.output?.statusCode === 429) {
-                        console.log('⚠️ تم تجاوز معدل الطلبات، جاري الانتظار...');
+                        console.log('⚠️ rate limit، انتظار 5 ثوان...');
                         await delay(5000);
                         return;
                     }
-                    console.error("خطأ في معالجة الرسائل:", خطأ)
-                    if (الرسالة.key && الرسالة.key.remoteJid) {
-                        await JawadBot.sendMessage(الرسالة.key.remoteJid, {
-                            text: '❌ حدث خطأ أثناء معالجة رسالتك.',
-                            contextInfo: {
-                                forwardingScore: 1,
-                                isForwarded: true,
-                                forwardedNewsletterMessageInfo: {
-                                    newsletterJid: global.معرف_القناة,
-                                    newsletterName: global.botname,
-                                    serverMessageId: -1
-                                }
-                            }
-                        }).catch(console.error);
-                    }
+                    console.error("خطأ في معالجة الرسائل:", خطأ.message)
                 }
             } catch (خطأ) {
-                // تجاهل أخطاء rate limit
                 if (خطأ?.data === 429 || خطأ?.output?.statusCode === 429) {
-                    console.log('⚠️ تم تجاوز معدل الطلبات، جاري الانتظار...');
+                    console.log('⚠️ rate limit، انتظار...');
                     await delay(5000);
                     return;
                 }
-                console.error("خطأ في تحديث الرسائل:", خطأ)
+                console.error("خطأ في تحديث الرسائل:", خطأ.message)
             }
         })
 
@@ -515,23 +540,25 @@ async function startJawadBot() {
         }
 
         JawadBot.public = true
-        JawadBot.serializeM = (m) => smsg(JawadBot, m, store)
+        JawadBot.serializeM = (m) => smsg ? smsg(JawadBot, m, store) : null
 
         // ============= معالجة الاتصال =============
+        let qrShownCount = 0;  // ✅ عدّاد لمنع تكرار QR
         JawadBot.ev.on('connection.update', async (s) => {
             const { connection, lastDisconnect, qr } = s
             
             if (qr) {
-                // عرض رابط QR كصورة في الطرفية
-                console.log(chalk.yellow('\n📱 امسح رمز QR التالي باستخدام واتساب:\n'))
-                console.log(qr)
-                console.log(chalk.yellow('\n🔗 إذا لم يظهر الرمز بشكل صحيح، استخدم هذا الرابط:'))
-                console.log(chalk.blue(`https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(qr)}`))
-                console.log(chalk.yellow('\nالخطوات:'))
-                console.log(chalk.white('1. افتح الرابط أعلاه في المتصفح'))
-                console.log(chalk.white('2. امسح رمز QR الذي يظهر'))
-                console.log(chalk.white('3. افتح واتساب > الإعدادات > الأجهزة المرتبطة > ربط جهاز'))
-                console.log(chalk.white('4. امسح الرمز\n'))
+                qrShownCount++;
+                console.log(chalk.yellow(`\n📱 امسح رمز QR (محاولة ${qrShownCount}):\n`))
+                if (qrcode) {
+                    qrcode.generate(qr, { small: true })
+                } else {
+                    console.log(chalk.blue(qr))
+                }
+                console.log(chalk.white('\nالخطوات:'))
+                console.log(chalk.white('1. امسح QR أعلاه مباشرة من واتساب'))
+                console.log(chalk.white('2. واتساب > الإعدادات > الأجهزة المرتبطة > ربط جهاز'))
+                console.log(chalk.white('3. لا تنتظر — امسح فورًا\n'))
             }
             
             if (connection === 'connecting') {
@@ -539,32 +566,22 @@ async function startJawadBot() {
             }
             
             if (connection == "open") {
-                console.log(chalk.magenta(` `))
-                console.log(chalk.green(`✅ تم الاتصال بنجاح!`))
+                qrShownCount = 0;  // ✅ إعادة تعيين عند النجاح
+                console.log(chalk.green(`\n✅ تم الاتصال بنجاح!`))
                 console.log(chalk.yellow(`📱 معلومات البوت: ` + JSON.stringify(JawadBot.user, null, 2)))
 
                 try {
                     const رقم_البوت = JawadBot.user.id.split(':')[0] + '@s.whatsapp.net';
                     await JawadBot.sendMessage(رقم_البوت, {
-                        text: `🤖 ${global.botname} v1.0.1 متصل بنجاح!\n\n⏰ الوقت: ${new Date().toLocaleString('ar-MA')}\n✅ الحالة: متصل وجاهز!\n\n✅ تأكد من الانضمام إلى القناة أدناه`,
-                        contextInfo: {
-                            forwardingScore: 1,
-                            isForwarded: true,
-                            forwardedNewsletterMessageInfo: {
-                                newsletterJid: global.معرف_القناة,
-                                newsletterName: global.botname,
-                                serverMessageId: -1
-                            }
-                        }
+                        text: `🤖 ${global.botname} v1.0.1 متصل بنجاح!\n\n⏰ ${new Date().toLocaleString('ar-MA')}`
                     });
                 } catch (خطأ) {
                     console.error('خطأ في إرسال رسالة الاتصال:', خطأ.message)
                 }
 
                 await delay(1999)
-                console.log(chalk.yellow(`\n\n                  ${chalk.bold.blue(`[ ${global.botname} v1.0.1 ]`)}\n\n`))
                 console.log(chalk.cyan(`< ================================================== >`))
-                console.log(chalk.magenta(`\n${global.motif_emoji} قناة يوتيوب: ${global.قناة_اليوتيوب}`))
+                console.log(chalk.magenta(`${global.motif_emoji} قناة يوتيوب: ${global.قناة_اليوتيوب}`))
                 console.log(chalk.magenta(`${global.motif_emoji} المطور: ${global.مطور}`))
                 console.log(chalk.green(`${global.motif_emoji} 🤖 البوت متصل بنجاح! ✅`))
                 console.log(chalk.blue(`نسخة البوت: ${settings.version}`))
@@ -579,16 +596,19 @@ async function startJawadBot() {
                 if (رمز_الحالة === DisconnectReason.loggedOut || رمز_الحالة === 401) {
                     try {
                         rmSync('./session', { recursive: true, force: true })
-                        console.log(chalk.yellow('تم حذف مجلد الجلسة. الرجاء إعادة المصادقة.'))
+                        console.log(chalk.yellow('تم حذف مجلد الجلسة.'))
                     } catch (خطأ) {
                         console.error('خطأ في حذف الجلسة:', خطأ)
                     }
-                    console.log(chalk.red('تم تسجيل الخروج من الجلسة. الرجاء إعادة المصادقة.'))
                 }
                 
                 if (shouldReconnect) {
-                    console.log(chalk.yellow('جاري إعادة الاتصال...'))
-                    await delay(5000)
+                    // ✅ انتظار أطول عند conflict
+                    const waitTime = (رمز_الحالة === 515 || رمز_الحالة === 440 || رمز_الحالة === 428) ? 30000 : 5000
+                    console.log(chalk.yellow(`جاري إعادة الاتصال بعد ${waitTime/1000} ثانية...`))
+                    await delay(waitTime)
+                    // ✅ منع التشغيل المكرر — إعادة تعيين العلم
+                    global.__JAWAD_BOT_STARTED__ = false
                     startJawadBot()
                 }
             }
@@ -599,7 +619,12 @@ async function startJawadBot() {
 
         JawadBot.ev.on('call', async (المكالمات) => {
             try {
-                const { readState: readAnticallState } = require('./commands/anticall');
+                let readAnticallState
+                try {
+                    ({ readState: readAnticallState } = require('./commands/anticall'));
+                } catch {
+                    return;
+                }
                 const الحالة = readAnticallState();
                 if (!الحالة.enabled) return;
                 for (const مكالمة of المكالمات) {
@@ -617,7 +642,7 @@ async function startJawadBot() {
                         if (!المبلغ_عنهم.has(رقم_المتصل)) {
                             المبلغ_عنهم.add(رقم_المتصل);
                             setTimeout(() => المبلغ_عنهم.delete(رقم_المتصل), 60000);
-                            await JawadBot.sendMessage(رقم_المتصل, { text: '📵 مكافحة المكالمات مفعلة. تم رفض مكالمتك وسيتم حظرك.' });
+                            await JawadBot.sendMessage(رقم_المتصل, { text: '📵 مكافحة المكالمات مفعلة.' });
                         }
                     } catch {}
                     setTimeout(async () => {
@@ -629,42 +654,32 @@ async function startJawadBot() {
 
         // ============= معالجة تحديثات المجموعة =============
         JawadBot.ev.on('group-participants.update', async (تحديث) => {
-            await handleGroupParticipantUpdate(JawadBot, تحديث);
+            try { await handleGroupParticipantUpdate(JawadBot, تحديث); } catch (e) {}
         });
 
         // ============= معالجة الحالات =============
-        JawadBot.ev.on('messages.upsert', async (m) => {
-            if (m.messages[0].key && m.messages[0].key.remoteJid === 'status@broadcast') {
-                await handleStatus(JawadBot, m);
-            }
-        });
-
         JawadBot.ev.on('status.update', async (حالة) => {
-            await handleStatus(JawadBot, حالة);
+            try { await handleStatus(JawadBot, حالة); } catch (e) {}
         });
 
         JawadBot.ev.on('messages.reaction', async (تفاعل) => {
-            await handleStatus(JawadBot, تفاعل);
+            try { await handleStatus(JawadBot, تفاعل); } catch (e) {}
         });
 
         return JawadBot
     } catch (خطأ) {
         console.error('خطأ في بدء البوت:', خطأ)
         await delay(5000)
+        global.__JAWAD_BOT_STARTED__ = false
         startJawadBot()
     }
 }
 
-// دالة isAdmin
-async function isAdmin(sock, jid, participant) {
-    try {
-        const groupMetadata = await sock.groupMetadata(jid);
-        const participantData = groupMetadata.participants.find(p => p.id === participant);
-        return participantData?.admin === 'admin' || participantData?.admin === 'superadmin';
-    } catch (error) {
-        console.error('خطأ في التحقق من صلاحيات المشرف:', error);
-        return false;
-    }
+// ✅ تصدير الدوال
+module.exports = {
+    isSudo,
+    isAdmin,
+    startJawadBot
 }
 
 // بدء البوت مع معالجة الأخطاء
@@ -674,11 +689,11 @@ startJawadBot().catch(خطأ => {
 })
 
 process.on('uncaughtException', (خطأ) => {
-    console.error('استثناء غير ملتقط:', خطأ)
+    console.error('استثناء غير ملتقط:', خطأ.message)
 })
 
 process.on('unhandledRejection', (خطأ) => {
-    console.error('رفض غير معالج:', خطأ)
+    console.error('رفض غير معالج:', خطأ?.message || خطأ)
 })
 
 let الملف = require.resolve(__filename)
